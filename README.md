@@ -6,6 +6,17 @@
 > questions for you. A standalone smoke client ([`policy_smoke.py`](policy_smoke.py), ~40 lines,
 > zmq + msgpack + opencv only) lets you test your server without any CloudChef code.
 
+## Two ways to integrate
+
+| | What you build | Needs a robot to develop | Document |
+|---|---|---|---|
+| **Policy server** (recommended) | An inference server that speaks our wire: observations in, joint targets out, 30 Hz | No | this page |
+| **Arm driver** | Your own ROS 2 node that reads the robot's topics and commands the arm directly, up to 200 Hz | Yes — rig access, which needs approval from the CloudChef team | [ARM_DRIVER_INTERFACE.md](ARM_DRIVER_INTERFACE.md) |
+
+Start with the policy server unless you need command rates above 30 Hz, torque
+feedback at source rate, or control over arm stiffness. The rest of this page is
+the policy-server contract.
+
 ## The ask in one paragraph
 
 Package your policy as a **long-lived inference server process** that speaks our
