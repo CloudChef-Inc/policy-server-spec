@@ -37,10 +37,14 @@ everything robot-side (cameras, joint I/O, safety, lifecycle, eval).
  └───────────────────────────┘                └────────────────────────────────────┘
 ```
 
-Our launcher starts your server on the GPU box as a subprocess, waits for a ready
-line, then connects the client. The client sends one observation per control tick
-and expects one action back. Sometimes both halves run on the same box; the wire is
-identical either way.
+**Today we start your server by hand** on the GPU box (the command above, in your
+venv) and our client attaches to it once the ready line has appeared. Automated
+launch — our launcher spawning your server as a subprocess, tailing stdout for the
+ready line, and reusing a warm server through the handshake (§3.3) — is the intended
+end state, and the process contract in §2 is written for it; build to §2 so nothing
+changes on your side when we switch. The client sends one observation per control
+tick and expects one action back. Sometimes both halves run on the same box; the wire
+is identical either way.
 
 ## 1. What you deliver
 
@@ -64,10 +68,10 @@ identical either way.
 | Config | **One JSON file**, path given by `--server-args-json`. Every runtime knob (checkpoint path, port, device, chunk length, …) is a key in it. No other CLI flags, no env vars required. Our config system writes this file verbatim from a profile. |
 | Required keys | `port` (int). Everything else is yours to define; we will pass through whatever your README lists. |
 | Bind | `tcp://0.0.0.0:<port>` — the robot reaches the GPU box over the LAN. |
-| Ready line | Print **exactly** `[PolicyServer] Listening on tcp://0.0.0.0:<port>` to stdout **after** the socket is bound and the model is loaded and warmed (first inference done). We tail stdout for it; nothing is sent before it appears. Keep it on one line, under 80 columns, with stdout unbuffered (`PYTHONUNBUFFERED=1` is set for you; flush anyway). |
-| Startup budget | Up to **10 minutes** load-to-ready is tolerated; under 60 s is what we see from comparable models. |
+| Ready line | Print **exactly** `[PolicyServer] Listening on tcp://0.0.0.0:<port>` to stdout **after** the socket is bound and the model is loaded and warmed (first inference done). Nothing is sent before it appears (an operator watches for it today; the launcher will tail stdout for it). Keep it on one line, under 80 columns, with stdout unbuffered (`PYTHONUNBUFFERED=1` is set for you; flush anyway). |
+| Startup budget | Under 60 s load-to-ready is what we see from comparable models. The launcher's default wait is **180 s**; it is configurable per model up to about 10 minutes — tell us your number if you need more than 180 s. |
 | Logging | stdout/stderr only (we capture both to a file). Log per-call latency at least every ~30 calls. |
-| Lifecycle | Serve forever until killed. We stop you with SIGKILL on the port (`fuser -k`), so never rely on shutdown hooks. Crashing is fine; hanging is not — a request that cannot be served must still get a reply (an error reply is OK; see §3.4). |
+| Lifecycle | Serve forever until killed. You are stopped with SIGKILL (the launcher uses `fuser -k` on the port), so never rely on shutdown hooks. Crashing is fine; hanging is not — a request that cannot be served must still get a reply (an error reply is OK; see §3.4). |
 | Concurrency | **One client, one request in flight, one episode at a time.** A plain single-threaded REQ/REP loop is exactly right. |
 
 ## 3. Wire protocol
@@ -90,16 +94,21 @@ Request (no `type` key):
   "images":         { "<camera>": <bytes JPEG> , ... }     — standard JPEG, quality 90 (cv2.imdecode gives BGR; convert to RGB)
   "image_encoding": "jpeg"
   "arm_mode":       "right" | "left" | "both"              — see §4
-  "timestamp_ns":   <int>    robot clock, monotonic within an episode
+  "timestamp_ns":   <int>    robot wall clock (Unix epoch ns); 0 in warmup observations
   "efforts":        <bytes>  float32 LE, optional           — joint torques; ignore unless you train on them
 }
 ```
 
 Camera keys are our canonical names and arrive as-is: `overhead`, `wrist_left`,
 `wrist_right`, `front`. **Read the ones your model uses and ignore the rest** — the
-set of cameras sent is a robot-side setting and may include extras. Frames are the
-cameras' native resolution (today 480×848 or 480×640, either orientation); **resize,
-crop, and normalise server-side**, exactly as training did. Do not assume a fixed size.
+set of cameras sent is a robot-side setting and may include extras. **Frame size
+depends on the robot and on the stream we configure for your model**, so do not
+assume one: RealSense robots send 480×848 or 480×640; ZED robots are 1920×1200 at
+the sensor and we normally send a downscaled stream (448×448 letterboxed, 640×384
+or 480×480 today). Tell us your training input geometry (§9) and we will pick the
+closest stream; **resize, crop, and normalise server-side**, exactly as training
+did. The JPEG you receive has been decoded and re-encoded at quality 90 on the
+robot.
 
 Reply:
 
@@ -129,7 +138,16 @@ smoothing and replan detection. Omit the key entirely if you have no queue.
 String keys to float32 arrays only (any length, including 1-element scalars). Keys
 starting with `latency_` are lifted into our telemetry automatically; e.g.
 `latency_infer_ms` (model forward time) and `latency_total_ms` (request to reply) are
-worth sending. Anything else is recorded alongside each episode for your debugging.
+worth sending. Anything else is recorded alongside each episode for your debugging,
+**except these reserved keys, which our client acts on — do not use them for
+anything else:**
+
+| Key | What our client does with it |
+|---|---|
+| `reward` | Treated as a success probability. By default, a value ≥ 0.9 on 3 consecutive ticks **ends the episode**: the client holds position and stops calling you until the next reset. Send it only if you mean that; tell us if you want the stop disabled or the threshold changed. |
+| `reward_binary` | Written by our client; do not send. |
+| `ee_pose_raw` | Interpreted as an end-effector pose for telemetry. |
+| any key starting with `_meta__` | Reserved for our own metadata. |
 
 ### 3.2 Reset (once per episode, before the first observation)
 
@@ -189,14 +207,20 @@ we can pin the gripper robot-side.
 
 ## 5. Timing
 
-- The client calls you at **30 Hz** and waits up to a configurable timeout (we set it to
-  cover your worst case — tell us your p99). Steady-state replies under ~25 ms keep the
-  loop real-time; a chunk-popping tick should be ~1 ms.
+- The client calls you at **30 Hz** (a per-model setting; tell us if you trained at
+  another rate) and waits up to a configurable timeout, **5 s by default** (we set
+  it to cover your worst case — tell us your p99). Steady-state replies under ~25 ms
+  keep the loop real-time; a chunk-popping tick should be ~1 ms. Treat a missed
+  timeout as fatal for the episode: always reply, even with an error (§3.4).
 - The **first observation after a reset** may be slow (full forward pass, maybe a JIT
   shape miss); tell us the number and keep it under ~5 s.
-- On connect our client sends a **warmup**: two observations with all-zero `qpos`, black
-  JPEG frames at 480×640 for all four cameras, then a reset. These must not crash
-  the server; the actions they produce are discarded.
+- On connect our client sends a **warmup**: two observations, then a reset. Each has
+  all-zero `qpos`, all-zero `efforts`, `timestamp_ns` 0 and black JPEG frames for
+  every camera configured for your model. **By default the warmup `qpos` is 7-D and
+  the frames are 480×640, whatever your `arm_mode` and real frame size** — we
+  override both per model, so tell us the `qpos_dim` and frame size your server
+  needs to see (§9). The warmup must not crash the server, and an error reply to it
+  fails the connect; the actions it produces are discarded.
 
 ## 6. What we handle (so you do not have to)
 
@@ -232,12 +256,17 @@ side (a custom client, ~150+ lines, plus a rig session):
 1. `arm_mode` / action layout (§4).
 2. Which cameras the model consumes, and the training input resolution per camera.
 3. Chunk length and replan schedule (every N ticks? on drain?). Will you send `actions`?
-4. Steady-state and first-call latency on a 5090; VRAM.
-5. Anything in §7.
+4. Steady-state and first-call latency on a 5090; VRAM; load-to-ready time.
+5. The `qpos_dim` and frame size your server needs in the warmup (§5), and whether
+   you send a `reward` extra (§3.1.2).
+6. Anything in §7.
 
 ## Smoke client
 
-[`policy_smoke.py`](policy_smoke.py) mirrors what our robot sends. Deps: `pip install pyzmq msgpack numpy opencv-python`.
+[`policy_smoke.py`](policy_smoke.py) sends the same message shapes as our robot: reset → 60
+observations → reset. It is a shape check, not a full stand-in — it sends no warmup
+(§5), no handshake (§3.3) and no `efforts`, always sends four cameras at 480×848,
+and waits 60 s per call where the robot waits 5 s. Deps: `pip install pyzmq msgpack numpy opencv-python`.
 
 ```bash
 python policy_smoke.py tcp://localhost:<port>        # edit arm_mode / dim at the top for 14-D
