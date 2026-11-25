@@ -34,7 +34,7 @@ At this level your node is the only thing between your software and the motors.
 
 - **The arm holds the last target it received, indefinitely.** There is no
   stale-command timeout. If your node stops publishing, crashes or loses the
-  network, the arm stays at the last commanded position, at full stiffness.
+  network, the arm keeps holding the last commanded position.
 - **Nothing smooths your commands.** A target far from the current position is
   executed as a step, at whatever speed the motors can reach. Rate-limit and
   interpolate on your side.
@@ -55,11 +55,13 @@ At this level your node is the only thing between your software and the motors.
 | Middleware | `rmw_cyclonedds_cpp` |
 | ROS domain ID, network addresses | given at approval |
 | Arm namespaces | `/components/follower_left`, `/components/follower_right` |
-| Custom message types | the [`ccros_msgs`](ccros_msgs/) package in this repo — build it in your workspace |
+| Custom message types | the [`ccros_msgs`](ccros_msgs/) package in this repo — build it in your own workspace |
 
-Only the impedance reference, the gains service and the gains-carrying
-trajectory action use `ccros_msgs`. Everything else is `std_msgs`,
-`sensor_msgs` and `control_msgs`.
+Only the impedance reference, the gains service, the control-mode service and
+the gains-carrying trajectory action use `ccros_msgs`. Everything else is
+`std_msgs`, `sensor_msgs` and `control_msgs`. The package here is a subset of
+ours with identical definitions: build it on your machine, never into a
+workspace on our robot, where it would shadow the full package.
 
 ## Joint layout
 
@@ -89,19 +91,31 @@ and `/components/cam_wrist_right`:
 
 | Topic | Type |
 |---|---|
-| `color/…/compressed` | `sensor_msgs/CompressedImage` (JPEG) |
+| `color/image_rect_raw/compressed` (overhead), `color/image_raw/compressed` (wrists) | `sensor_msgs/CompressedImage` (JPEG) |
 | `color/camera_info` | `sensor_msgs/CameraInfo` |
 | `aligned_depth_to_color/image_raw` (overhead only) | `sensor_msgs/Image`, depth registered to colour |
 
-Exact colour topic names and resolutions depend on the robot; we give you the
-list for the rig you are approved on. Use each message's header stamp, not your
-receive time, to align streams.
+Topic names and resolutions can differ per robot, and downscaled colour streams
+are available; we give you the list for the rig you are approved on. Use each
+message's header stamp, not your receive time, to align streams.
 
 ## What you write
 
 Pick **one** of the three command paths per arm. All command subscriptions are
 reliable with a queue depth of 1: only the newest message matters, and the
 driver consumes at most one command per 5 ms.
+
+What happens to a bad command differs by path:
+
+| Path | Target outside the joint limits | Non-finite value |
+|---|---|---|
+| Position targets | clipped to the limit | message refused |
+| Gripper | clamped to [0, 1] | message ignored |
+| Impedance reference | `position` outside the limits: message **refused**. `command` joints: clipped | message refused |
+| Trajectory | not checked at accept; the motor command is clipped during execution, which can abort the goal on the path tolerance | — |
+
+Refused means the previous target stays in force. Do not use clipping as a
+limiter: stay inside the limits yourself.
 
 ### 1. Position targets
 
@@ -134,10 +148,13 @@ What you can rely on:
 - Overall stiffness is one scale factor, set by us per session.
 - A reference is extrapolated with its velocity and acceleration for at most
   10 ms, then held at rest. Publish faster than that for continuous motion.
-- A message with a non-finite value, a reference outside the joint limits, or a
-  gripper value outside [0, 1] is **refused**: the previous target stays in
-  force. Refusals are counted and reported to our operator, not to you — check
-  your values against `reference_controller/limits` before sending.
+- A message with a non-finite value, a reference `position` outside the joint
+  limits, or a gripper value outside [0, 1] is **refused**: the previous target
+  stays in force. Refusals are counted and reported to our operator, not to
+  you — check your values against `reference_controller/limits` before sending.
+- If the arm is held away from its reference for about half a second, the
+  driver can latch a hold at the measured position instead of continuing to
+  push. Tell the operator if your task presses on a surface for longer.
 
 ### 3. Trajectories
 
@@ -147,8 +164,9 @@ What you can rely on:
 | `follow_joint_trajectory_gains` | [`ccros_msgs/action/FollowJointTrajectoryGains`](ccros_msgs/action/FollowJointTrajectoryGains.action) |
 
 The driver splines the trajectory and executes it at control rate. The second
-action is the same with position gains carried in the goal, applied to that goal
-only.
+action carries position gains in the goal — but on the rigs this document
+covers, goal gains are not applied: send **empty** `gains` (a goal with
+non-empty gains is rejected). Trajectories run at the arm's configured gains.
 
 A goal is rejected when:
 
@@ -157,7 +175,13 @@ A goal is rejected when:
 - `joint_names` is not exactly the 6 arm joints (bare `joint_0` or prefixed
   `follower_right/joint_0`, any order);
 - `time_from_start` is not strictly increasing;
-- another trajectory is active (cancel it first — one goal at a time).
+- another trajectory is active (cancel it first — one goal at a time);
+- gains set with `set_arm_gains` are in force on the arm;
+- the goal carries non-empty gains (see above).
+
+An accepted goal is aborted if the arm leaves the path by more than 0.25 rad on
+any joint, or does not settle within 0.05 rad of the final point within 0.5 s
+of the trajectory's end.
 
 Trajectories move the 6 arm joints only; command the gripper on its topic.
 
@@ -174,15 +198,23 @@ the maximum; each joint can be lowered to one eighth of stock:
 |---|---|---|---|---|---|---|
 | kp stock, N·m/rad | 500 | 500 | 500 | 200 | 80 | 40 |
 | kp minimum | 62.5 | 62.5 | 62.5 | 25 | 10 | 5 |
-| kd stock, N·m·s/rad | 5 | 5 | 5 | 3 | 1.5 | 1.5 |
-| kd minimum | 1.76 | 1.76 | 1.76 | 1.06 | 0.53 | 0.53 |
+| kd stock, N·m·s/rad | 5 | 5 | 5 | 3 | 1.0 | 1.5 |
+| kd minimum | 1.76 | 1.76 | 1.76 | 1.06 | 0.35 | 0.53 |
 
-Values outside the range are clamped, and the response reports what was applied.
-Fill `owner` with your node's fully-qualified name: the driver restores the
-configured gains by itself about a second after that node leaves the ROS graph.
-While gains set this way are in force, trajectory goals are rejected. Lower
-gains mean larger tracking error under load; the arm will sag further from its
-target.
+Values outside the range are clamped, and the response reports what was applied
+— trust `applied_kp` / `applied_kd` over this table.
+
+- The call is refused unless the arm is in `position` mode with no trajectory
+  active. When it succeeds the arm is commanded to hold its measured position.
+- Fill `owner` with your node's fully-qualified name: the driver restores the
+  configured gains by itself one to two seconds after that node leaves the ROS
+  graph. A node that crashes without shutting down is only seen as gone once
+  the middleware times it out, which takes longer.
+- Any `set_control_mode` call also ends the gains.
+- While gains set this way are in force, trajectory goals are rejected.
+
+Lower gains mean larger tracking error under load; the arm will sag further
+from its target.
 
 ## Control mode
 
