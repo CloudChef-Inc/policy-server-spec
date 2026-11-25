@@ -1,0 +1,16 @@
+# Set the position gains of the 6 arm joints (<arm>/set_arm_gains).
+# gains.kp / gains.kd: each either 6 values or EMPTY (= the arm's configured
+# value for that list). Both empty = back to the configured gains.
+#   kp: N*m/rad, finite, > 0.   kd: N*m*s/rad, finite, > 0.
+# Each value is CLAMPED per joint: kp into [stock / 8, stock], kd into
+# [stock / sqrt(8), stock]. The response carries what was applied.
+ccros_msgs/ArmGains gains
+# The caller's fully-qualified node name. While the gains are in force the
+# driver checks about once a second that this node is still in the ROS graph
+# and restores the configured gains once it is gone. Empty = no watch.
+string owner
+---
+bool ok
+string error
+float64[] applied_kp   # N*m/rad
+float64[] applied_kd   # N*m*s/rad
