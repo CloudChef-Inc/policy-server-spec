@@ -63,6 +63,31 @@ the gains-carrying trajectory action use `ccros_msgs`. Everything else is
 ours with identical definitions: build it on your machine, never into a
 workspace on our robot, where it would shadow the full package.
 
+### Running on the robot's computer
+
+The quickest way to start is to run your node on the robot's own computer, over
+ssh. We give you an unprivileged login there and one setup file to source. It
+selects the ROS 2 distribution, the middleware, the ROS domain and our message
+types, so `rclpy` sees the arm and camera topics with nothing to install or
+build:
+
+```bash
+ssh <login>@<robot computer>          # both given at approval
+source <setup file given at approval>
+python3 arm_driver_sample.py          # read only: prints every topic below for 5 s
+```
+
+[`arm_driver_sample.py`](arm_driver_sample.py) (standard library and `rclpy`
+only) subscribes to every topic in [What you read](#what-you-read) and prints
+its rate and latest value. With `--wiggle` it also moves one wrist joint by
+0.05 rad and back on the position path, as a template for a first command: it
+starts from the measured position, ramps, refuses to run if another node is
+commanding the arm, and stops if any other joint moves. Run `--wiggle` only
+with our operator at the emergency stop.
+
+Copy your own scripts in for the session and remove them afterwards. The login
+cannot read or change our software.
+
 ## Joint layout
 
 Each arm has 6 revolute joints and a gripper.
